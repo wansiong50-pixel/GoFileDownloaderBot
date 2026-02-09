@@ -1,2 +1,4 @@
-python-telegram-bot[job-queue]
+python-telegram-bot[rate-limiter]
+yt-dlp
 flask
+requests
