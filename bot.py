@@ -1,265 +1,227 @@
-import logging
-import sqlite3
 import os
-from datetime import datetime, timedelta, timezone
-from threading import Thread
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, 
-    ContextTypes, 
-    MessageHandler, 
-    CallbackQueryHandler, 
-    CommandHandler, 
-    filters, 
-    AIORateLimiter 
-)
+import asyncio
+import threading
+import logging
+import json
+import requests
+import yt_dlp
 from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-# ==============================================================================
-# ⚙️ CONFIGURATION (STRICTLY FROM ENVIRONMENT)
-# ==============================================================================
+# --- LOGGING SETUP ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- FAKE WEB SERVER (To keep Render awake) ---
+app_flask = Flask(__name__)
+
+@app_flask.route('/')
+def health_check():
+    return "Bot is alive and running!"
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    app_flask.run(host='0.0.0.0', port=port)
+
+# --- CONFIGURATION ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")
-ADMIN_ID_RAW = os.environ.get("ADMIN_ID")
-# 👇 NOW CLEAN: If you forget to set the var, it just says "Link not set"
-DONATION_LINK = os.environ.get("DONATION_LINK", "Link not set") 
+DOWNLOAD_DIR = "downloads"
 
-if not BOT_TOKEN or not CHANNEL_ID or not ADMIN_ID_RAW:
-    print("⚠️ CRITICAL: Environment Variables Missing. Bot will likely fail.")
-else:
+if not os.path.exists(DOWNLOAD_DIR):
+    os.makedirs(DOWNLOAD_DIR)
+
+# --- HELPER: STREAM TO GOFILE (For Large Files > 50MB) ---
+async def stream_to_gofile(url, format_type):
+    """
+    Streams data from yt-dlp -> curl -> GoFile.
+    Never saves the full file to disk, allowing 2GB+ uploads on free tier.
+    """
     try:
-        ADMIN_ID = int(ADMIN_ID_RAW)
-    except ValueError:
-        raise ValueError("❌ ADMIN_ID must be a number!")
+        # 1. Get the best GoFile server
+        api_resp = requests.get("https://api.gofile.io/getServer").json()
+        if api_resp['status'] != 'ok':
+            return None, "GoFile API unavailable"
+        server = api_resp['data']['server']
+        upload_url = f"https://{server}.gofile.io/uploadFile"
 
-DAILY_LIMIT = 100
-
-# ==============================================================================
-# 🕒 TIMEZONE HELPER (MALAYSIA GMT+8)
-# ==============================================================================
-def get_malaysia_date():
-    utc_now = datetime.now(timezone.utc)
-    myt_now = utc_now + timedelta(hours=8)
-    return myt_now.strftime("%Y-%m-%d")
-
-# ==============================================================================
-# 🌐 KEEP ALIVE SERVER
-# ==============================================================================
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is running on Malaysia Time!"
-
-def run_http():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run_http)
-    t.start()
-
-# ==============================================================================
-# 🗄️ DATABASE MANAGEMENT
-# ==============================================================================
-def init_db():
-    conn = sqlite3.connect("quota.db")
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS user_quota (
-            user_id INTEGER PRIMARY KEY,
-            date TEXT,
-            count INTEGER
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS banned_users (
-            user_id INTEGER PRIMARY KEY
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def is_banned(user_id):
-    conn = sqlite3.connect("quota.db")
-    cur = conn.cursor()
-    row = cur.execute("SELECT user_id FROM banned_users WHERE user_id=?", (user_id,)).fetchone()
-    conn.close()
-    return row is not None
-
-def ban_user_db(target_id):
-    conn = sqlite3.connect("quota.db")
-    try:
-        conn.execute("INSERT INTO banned_users VALUES (?)", (target_id,))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
-
-def unban_user_db(target_id):
-    conn = sqlite3.connect("quota.db")
-    conn.execute("DELETE FROM banned_users WHERE user_id=?", (target_id,))
-    conn.commit()
-    conn.close()
-
-def check_and_update_quota(user_id):
-    conn = sqlite3.connect("quota.db")
-    cur = conn.cursor()
-    today = get_malaysia_date()
-    
-    row = cur.execute("SELECT date, count FROM user_quota WHERE user_id=?", (user_id,)).fetchone()
-    
-    current_count = 0
-    if row is None:
-        cur.execute("INSERT INTO user_quota VALUES (?, ?, 1)", (user_id, today))
-        current_count = 1
-    else:
-        last_date, count = row
-        if last_date != today:
-            current_count = 1
-            cur.execute("UPDATE user_quota SET date=?, count=1 WHERE user_id=?", (today, user_id))
+        # 2. Prepare filenames and commands
+        # We use a shell pipe: yt-dlp outputs to stdout (-o -) -> curl reads from stdin (file=@-)
+        if format_type == 'mp3':
+            filename = "audio.mp3"
+            cmd = f'yt-dlp -f bestaudio -o - "{url}" | curl -F "file=@-;filename={filename}" {upload_url}'
         else:
-            current_count = count + 1
-            cur.execute("UPDATE user_quota SET count=? WHERE user_id=?", (current_count, user_id))
-            
-    conn.commit()
-    conn.close()
-    return current_count
+            filename = "video.mp4"
+            cmd = f'yt-dlp -f best -o - "{url}" | curl -F "file=@-;filename={filename}" {upload_url}'
 
-def get_current_quota(user_id):
-    conn = sqlite3.connect("quota.db")
-    cur = conn.cursor()
-    row = cur.execute("SELECT count, date FROM user_quota WHERE user_id=?", (user_id,)).fetchone()
-    conn.close()
-    
-    today = get_malaysia_date()
-    if row and row[1] == today:
-        return row[0]
-    return 0
+        # 3. Execute the pipeline
+        process = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        # 4. Parse response
+        response_text = stdout.decode().strip()
+        if not response_text:
+            logger.error(f"GoFile Error: {stderr.decode()}")
+            return None, "Upload failed (Check logs)"
 
-# ==============================================================================
-# 👮 ADMIN COMMANDS
-# ==============================================================================
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    try:
-        target_id = int(context.args[0])
-        if ban_user_db(target_id):
-            await update.message.reply_text(f"✅ User `{target_id}` BANNED.", parse_mode="Markdown")
+        json_resp = json.loads(response_text)
+        if json_resp['status'] == 'ok':
+            return json_resp['data']['downloadPage'], None
         else:
-            await update.message.reply_text(f"⚠️ User `{target_id}` is already banned.")
-    except:
-        await update.message.reply_text("❌ Usage: `/ban 123456789`")
+            return None, "GoFile upload failed."
 
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    try:
-        target_id = int(context.args[0])
-        unban_user_db(target_id)
-        await update.message.reply_text(f"✅ User `{target_id}` UNBANNED.", parse_mode="Markdown")
-    except:
-        await update.message.reply_text("❌ Usage: `/unban 123456789`")
-
-# ==============================================================================
-# 📩 MAIN CONFESSION HANDLER
-# ==============================================================================
-async def confession_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    msg = update.message
-    
-    if is_banned(user_id): return 
-
-    sent_msg = None 
-
-    # --- PHOTO ---
-    if msg.photo:
-        if user_id != ADMIN_ID:
-            await msg.reply_text("❌ Maaf, buat masa ni hanya Admin boleh hantar gambar! 🙏")
-            return
-        caption = msg.caption if msg.caption else ""
-        try:
-            sent_msg = await context.bot.send_photo(chat_id=CHANNEL_ID, photo=msg.photo[-1].file_id, caption=caption)
-        except Exception as e:
-            await msg.reply_text(f"❌ Error sending photo: {e}")
-            return
-
-    # --- TEXT ---
-    elif msg.text:
-        usage = get_current_quota(user_id)
-        if usage >= DAILY_LIMIT:
-            await msg.reply_text("❌ Limit harian (100) dah habis. Cuba lagi esok ya!")
-            return
-
-        try:
-            sent_msg = await context.bot.send_message(chat_id=CHANNEL_ID, text=msg.text)
-        except Exception as e:
-            await msg.reply_text(f"❌ Error sending to channel: {e}")
-            return
-            
-        check_and_update_quota(user_id)
-
-    # --- REPLY ---
-    if sent_msg:
-        final_usage = get_current_quota(user_id)
-        link = f"https://t.me/{CHANNEL_ID.replace('@', '')}/{sent_msg.message_id}"
-        
-        # Admin Log (with link for easy tracking)
-        timestamp = get_malaysia_date() + " " + datetime.now(timezone.utc).strftime("%H:%M:%S") + " MYT"
-        confession_preview = (msg.text[:100] + "...") if msg.text and len(msg.text) > 100 else (msg.text or "[Photo]")
-        log_text = (
-            f"🚨 **Confession Log**\n"
-            f"⏰ {timestamp}\n"
-            f"👤 **User ID:** `{user_id}`\n"
-            f"💬 **Msg:** {confession_preview}\n"
-            f"🔗 **Link:** {link}\n"
-            f"🚫 To ban: `/ban {user_id}`"
-        )
-        try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=log_text, parse_mode="Markdown")
-        except: pass
-        
-        keyboard = [[InlineKeyboardButton("🔎 See Message", url=link)]]
-        if user_id == ADMIN_ID:
-            keyboard.append([InlineKeyboardButton("📌 Pin Post", callback_data=f"pin_{sent_msg.message_id}")])
-
-        reply_text = (
-            "🎉yeayy mesej min dah hantar dalam channel ye🎉🤭 jgn nakal\n"
-            "ii tau min ban nanti ❗\n\n"
-            "link donation untuk admin\n"
-            f"{DONATION_LINK}\n\n"
-            "This bot is built with @ForwardBuilderBot\n"
-            "-----------------------------------------\n"
-            "**Free Daily Quota**\n"
-            f"Text: {final_usage}/{DAILY_LIMIT}\n"
-            "Media: 0/0"
-        )
-        await msg.reply_text(reply_text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def pin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ADMIN_ID: return
-
-    try:
-        await context.bot.pin_chat_message(chat_id=CHANNEL_ID, message_id=int(query.data.split("_")[1]))
-        await context.bot.send_message(chat_id=query.from_user.id, text="✅ Pinned!")
     except Exception as e:
-        await context.bot.send_message(chat_id=query.from_user.id, text=f"❌ Failed: {e}")
+        logger.error(f"Stream Error: {e}")
+        return None, str(e)
+
+# --- HELPER: LOCAL DOWNLOAD (For Small Files < 50MB) ---
+def download_local(url, format_type, chat_id):
+    ydl_opts = {
+        'outtmpl': f'{DOWNLOAD_DIR}/{chat_id}_%(title)s.%(ext)s',
+        'quiet': True,
+        'noplaylist': True,
+        'writethumbnail': True,
+    }
+
+    if format_type == "mp3":
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [
+                {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'},
+                {'key': 'FFmpegMetadata', 'add_metadata': True},
+                {'key': 'EmbedThumbnail'},
+            ],
+        })
+    else:
+        ydl_opts.update({
+            'format': 'best[filesize<50M]', # Strict limit for Telegram API
+            'postprocessors': [{'key': 'FFmpegMetadata', 'add_metadata': True}],
+        })
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        # yt-dlp might change extension after conversion (e.g. webm -> mp3)
+        if format_type == "mp3":
+            base = filename.rsplit(".", 1)[0]
+            if os.path.exists(base + ".mp3"):
+                filename = base + ".mp3"
+                
+        return filename, info.get('title', 'Media'), info.get('uploader', 'Unknown')
+
+# --- BOT HANDLERS ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Send me a link! I handle both small (<50MB) and HUGE files!")
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text
+    if not url.startswith("http"):
+        await update.message.reply_text("Please send a valid HTTP link.")
+        return
+
+    # Create buttons
+    keyboard = [
+        [
+            InlineKeyboardButton("🎵 MP3 (Audio)", callback_data=f"mp3|{url}"),
+            InlineKeyboardButton("🎬 MP4 (Video)", callback_data=f"mp4|{url}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Choose format:", reply_markup=reply_markup)
+
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer() # Stop loading animation
+    
+    try:
+        data = query.data.split("|", 1)
+        format_type = data[0]
+        url = data[1]
+    except IndexError:
+        await query.edit_message_text("❌ Error processing link.")
+        return
+    
+    await query.edit_message_text(f"⏳ Analyzing file size for {format_type.upper()}...")
+    
+    # 1. Check File Size (Head Request via yt-dlp)
+    limit_bytes = 50 * 1024 * 1024 # 50MB
+    is_large_file = False
+    
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+            info = await asyncio.to_thread(ydl.extract_info, url, download=False)
+            filesize = info.get('filesize') or info.get('filesize_approx') or 0
+            
+            if filesize > limit_bytes or filesize == 0:
+                is_large_file = True
+    except Exception as e:
+        # If check fails, default to Large File mode to be safe
+        is_large_file = True
+
+    # --- ROUTE A: LARGE FILE (Stream to GoFile) ---
+    if is_large_file:
+        await query.edit_message_text(
+            f"📦 File is large (>50MB).\nTelegram can't handle this directly.\n"
+            f"🚀 **Streaming to GoFile...** (This generates a download link)"
+        )
+        
+        link, error = await stream_to_gofile(url, format_type)
+        
+        if link:
+            await query.edit_message_text(
+                f"✅ **Download Ready!**\n\n"
+                f"🔗 [Click here to download your {format_type.upper()}]({link})\n\n"
+                f"_(Link hosted by GoFile)_",
+                parse_mode='Markdown'
+            )
+        else:
+            await query.edit_message_text(f"❌ Streaming failed: {error}")
+
+    # --- ROUTE B: SMALL FILE (Direct Telegram Upload) ---
+    else:
+        await query.edit_message_text(f"⬇️ Downloading {format_type.upper()} locally...")
+        
+        file_path = None
+        try:
+            file_path, title, author = await asyncio.to_thread(download_local, url, format_type, query.message.chat_id)
+            
+            await query.edit_message_text(f"⬆️ Uploading to Telegram...")
+            
+            with open(file_path, 'rb') as f:
+                if format_type == "mp3":
+                    await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=title, performer=author)
+                else:
+                    await context.bot.send_video(chat_id=query.message.chat_id, video=f, caption=title)
+            
+            await query.delete_message()
+            
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+        finally:
+            # Cleanup: Always delete the local file
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
 
 if __name__ == '__main__':
-    init_db()
-    keep_alive()
-    
-    if os.environ.get("BOT_TOKEN"): print("✅ Env Vars Found.")
-    else: print("⚠️ Warning: Env Vars Missing.")
+    # Start web server in background
+    threading.Thread(target=run_web_server).start()
 
-    app_bot = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
-    
-    app_bot.add_handler(CommandHandler("ban", ban_command))
-    app_bot.add_handler(CommandHandler("unban", unban_command))
-    app_bot.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, confession_handler))
-    app_bot.add_handler(CallbackQueryHandler(pin_callback, pattern="^pin_"))
-    
-    print("Bot is running...")
-    app_bot.run_polling()
+    if not BOT_TOKEN:
+        print("Error: BOT_TOKEN not set in environment variables.")
+    else:
+        app = ApplicationBuilder().token(BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+        app.add_handler(CallbackQueryHandler(button_click))
+        
+        print("Bot is polling...")
+        app.run_polling()
