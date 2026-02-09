@@ -247,3 +247,4 @@ if __name__ == '__main__':
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
         app.add_handler(CallbackQueryHandler(button_click))
         app.run_polling()
+
