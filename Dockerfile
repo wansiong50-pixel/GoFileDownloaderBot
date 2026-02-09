@@ -1,9 +1,9 @@
 # Use a lightweight Python version
 FROM python:3.10-slim
 
-# Install FFmpeg (for media conversion) and Curl (for streaming uploads)
+# UPDATE: Install Node.js (Crucial for YouTube Signatures), FFmpeg, and Curl
 RUN apt-get update && \
-    apt-get install -y ffmpeg curl && \
+    apt-get install -y ffmpeg curl nodejs && \
     rm -rf /var/lib/apt/lists/*
 
 # Set up work directory
