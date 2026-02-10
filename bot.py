@@ -37,10 +37,10 @@ async def stream_to_gofile(url, format_string, filename):
         server = api['data']['server']
         upload_url = f"https://{server}.gofile.io/uploadFile"
 
-        # UPDATE: Changed to 'ios' client which handles cookies better than android
+        # UPDATE: Changed to 'tv' client which is robust against blocks
         cmd = (
             f'yt-dlp --cookies cookies.txt '
-            f'--extractor-args "youtube:player_client=ios" '
+            f'--extractor-args "youtube:player_client=tv" '
             f'-f "{format_string}" -o - "{url}" | '
             f'curl -F "file=@-;filename={filename}" {upload_url}'
         )
@@ -72,8 +72,8 @@ def download_local(url, format_string, chat_id, is_audio=False):
         'format': format_string,
         'writethumbnail': True,
         'cookiefile': 'cookies.txt',
-        # UPDATE: Use iOS client
-        'extractor_args': {'youtube': {'player_client': ['ios']}},
+        # UPDATE: Use TV client
+        'extractor_args': {'youtube': {'player_client': ['tv']}},
     }
 
     if is_audio:
@@ -98,7 +98,7 @@ def download_local(url, format_string, chat_id, is_audio=False):
 
 # --- BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send me a link! (iOS Mode 🍏)")
+    await update.message.reply_text("👋 Send me a link! (TV Mode 📺)")
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
@@ -157,12 +157,12 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     use_gofile = False
     
     try:
-        # UPDATE: Check size using iOS Client args
+        # UPDATE: Check size using TV Client args
         ydl_opts_check = {
             'quiet': True, 
             'format': fmt, 
             'cookiefile': 'cookies.txt',
-            'extractor_args': {'youtube': {'player_client': ['ios']}}
+            'extractor_args': {'youtube': {'player_client': ['tv']}}
         }
         with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
             info = await asyncio.to_thread(ydl.extract_info, url, download=False)
@@ -212,4 +212,3 @@ if __name__ == '__main__':
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
         app.add_handler(CallbackQueryHandler(button_click))
         app.run_polling()
-        
