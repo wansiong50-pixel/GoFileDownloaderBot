@@ -37,11 +37,10 @@ async def stream_to_gofile(url, format_string, filename):
         server = api['data']['server']
         upload_url = f"https://{server}.gofile.io/uploadFile"
 
-        # UPDATE: Added --extractor-args to pretend to be an Android phone
-        # This bypasses the "Data Center" blocks on video formats
+        # UPDATE: Changed to 'ios' client which handles cookies better than android
         cmd = (
             f'yt-dlp --cookies cookies.txt '
-            f'--extractor-args "youtube:player_client=android" '
+            f'--extractor-args "youtube:player_client=ios" '
             f'-f "{format_string}" -o - "{url}" | '
             f'curl -F "file=@-;filename={filename}" {upload_url}'
         )
@@ -73,8 +72,8 @@ def download_local(url, format_string, chat_id, is_audio=False):
         'format': format_string,
         'writethumbnail': True,
         'cookiefile': 'cookies.txt',
-        # UPDATE: Force Android Client to see all formats
-        'extractor_args': {'youtube': {'player_client': ['android']}},
+        # UPDATE: Use iOS client
+        'extractor_args': {'youtube': {'player_client': ['ios']}},
     }
 
     if is_audio:
@@ -99,7 +98,7 @@ def download_local(url, format_string, chat_id, is_audio=False):
 
 # --- BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send me a link! (Mobile Mode 📱)")
+    await update.message.reply_text("👋 Send me a link! (iOS Mode 🍏)")
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
@@ -149,7 +148,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ext = "mp3"
         is_audio = True
     else: 
-        # Relaxed format string: Try strict first, but fallback to 'best' if specific height is missing
+        # Relaxed format string
         fmt = f"bestvideo[height<={target_quality}]+bestaudio/best[height<={target_quality}]/best"
         ext = "mp4"
         is_audio = False
@@ -158,12 +157,12 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     use_gofile = False
     
     try:
-        # UPDATE: Check size using Android Client args
+        # UPDATE: Check size using iOS Client args
         ydl_opts_check = {
             'quiet': True, 
             'format': fmt, 
             'cookiefile': 'cookies.txt',
-            'extractor_args': {'youtube': {'player_client': ['android']}}
+            'extractor_args': {'youtube': {'player_client': ['ios']}}
         }
         with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
             info = await asyncio.to_thread(ydl.extract_info, url, download=False)
