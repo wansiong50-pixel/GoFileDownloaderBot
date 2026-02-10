@@ -37,8 +37,14 @@ async def stream_to_gofile(url, format_string, filename):
         server = api['data']['server']
         upload_url = f"https://{server}.gofile.io/uploadFile"
 
-        # UPDATE 1: Added --cookies cookies.txt
-        cmd = f'yt-dlp --cookies cookies.txt -f "{format_string}" -o - "{url}" | curl -F "file=@-;filename={filename}" {upload_url}'
+        # UPDATE: Added --extractor-args to pretend to be an Android phone
+        # This bypasses the "Data Center" blocks on video formats
+        cmd = (
+            f'yt-dlp --cookies cookies.txt '
+            f'--extractor-args "youtube:player_client=android" '
+            f'-f "{format_string}" -o - "{url}" | '
+            f'curl -F "file=@-;filename={filename}" {upload_url}'
+        )
 
         process = await asyncio.create_subprocess_shell(
             cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -66,7 +72,9 @@ def download_local(url, format_string, chat_id, is_audio=False):
         'noplaylist': True,
         'format': format_string,
         'writethumbnail': True,
-        'cookiefile': 'cookies.txt', # UPDATE 2: Added this line
+        'cookiefile': 'cookies.txt',
+        # UPDATE: Force Android Client to see all formats
+        'extractor_args': {'youtube': {'player_client': ['android']}},
     }
 
     if is_audio:
@@ -91,7 +99,7 @@ def download_local(url, format_string, chat_id, is_audio=False):
 
 # --- BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send me a link! I'm authenticated 🍪")
+    await update.message.reply_text("👋 Send me a link! (Mobile Mode 📱)")
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
@@ -141,7 +149,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ext = "mp3"
         is_audio = True
     else: 
-        fmt = f"bestvideo[height<={target_quality}]+bestaudio/best[height<={target_quality}]"
+        # Relaxed format string: Try strict first, but fallback to 'best' if specific height is missing
+        fmt = f"bestvideo[height<={target_quality}]+bestaudio/best[height<={target_quality}]/best"
         ext = "mp4"
         is_audio = False
 
@@ -149,13 +158,17 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     use_gofile = False
     
     try:
-        # UPDATE 3: Added cookiefile here too
-        with yt_dlp.YoutubeDL({'quiet': True, 'format': fmt, 'cookiefile': 'cookies.txt'}) as ydl:
+        # UPDATE: Check size using Android Client args
+        ydl_opts_check = {
+            'quiet': True, 
+            'format': fmt, 
+            'cookiefile': 'cookies.txt',
+            'extractor_args': {'youtube': {'player_client': ['android']}}
+        }
+        with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
             info = await asyncio.to_thread(ydl.extract_info, url, download=False)
             filesize = info.get('filesize') or info.get('filesize_approx') or 0
             
-            # Use GoFile ONLY if we are sure it's huge. 
-            # If unknown (0), we try local first (safer for authenticated downloads)
             if filesize > limit_50mb:
                 use_gofile = True
             else:
@@ -163,7 +176,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
     except Exception as e:
         logger.error(f"Size check error: {e}")
-        use_gofile = False # Default to local on error
+        use_gofile = False 
 
     # 2. RUN DOWNLOAD
     if use_gofile:
@@ -200,3 +213,4 @@ if __name__ == '__main__':
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
         app.add_handler(CallbackQueryHandler(button_click))
         app.run_polling()
+        
